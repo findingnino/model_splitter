@@ -1,0 +1,39 @@
+# Virtual environment (regenerable)
+venv/
+.venv/
+env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# PyInstaller artifacts
+build/
+dist/
+*.spec.bak
+
+# Default output directories produced by the tool
+split_output*/
+test_output*/
+test_*/
+dist_output/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Large local input samples
+*.stl
+*.3mf
+# (re-include the small sample models that live in samples/ if we add any later)
+!samples/*.stl
+!samples/*.3mf
