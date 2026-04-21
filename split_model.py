@@ -64,6 +64,12 @@ MAX_DOWELS_PER_FACE     = 6      # cap, even on huge faces
 
 # Default set of sizes the program may choose from when user picks "auto"
 DEFAULT_DOWEL_SET_MM = [6.35, 9.525, 12.7, 15.875]  # 1/4", 3/8", 1/2", 5/8"
+
+# Wall markings: unique letter label engraved into each shared cut face
+MARK_ENGRAVE_DEPTH_MM   = 0.6    # how deep the letter is pressed into each piece
+MARK_TEXT_HEIGHT_MIN_MM = 4.0    # too small to read below this
+MARK_TEXT_HEIGHT_MAX_MM = 18.0   # cap so it doesn't dominate the face
+MARK_FONT_FAMILY        = "DejaVu Sans"  # bundled with matplotlib
 PRINT_SAFETY_FRACTION   = 0.10   # 10 % less than the printer's stated volume
 DEBRIS_VERT_RATIO       = 1e-3   # drop conn-components smaller than this
 MIN_PIECE_VOLUME_MM3    = 20.0   # drop empty/tiny leftovers after cutting
@@ -429,22 +435,173 @@ def _make_cylinder_world(center_xyz: np.ndarray, axis: int,
     return cyl
 
 
+# ---------- wall-marking labels ----------
+
+def _label_for_index(i: int) -> str:
+    """0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA, 27 -> AB, ..."""
+    result = ""
+    n = i + 1
+    while n > 0:
+        n -= 1
+        result = chr(ord("A") + n % 26) + result
+        n //= 26
+    return result
+
+
+def _text_to_polygon(text: str, size_mm: float):
+    """Convert a text string to a shapely (Multi)Polygon."""
+    from matplotlib.textpath import TextPath
+    from matplotlib.font_manager import FontProperties
+
+    fp = FontProperties(family=MARK_FONT_FAMILY)
+    tp = TextPath((0, 0), text, size=size_mm, prop=fp)
+    raw_polys = tp.to_polygons()
+    if not raw_polys:
+        return None
+
+    polys = []
+    for p in raw_polys:
+        if len(p) < 3:
+            continue
+        sp = sg.Polygon(p).buffer(0)
+        if sp.is_empty:
+            continue
+        if sp.geom_type == "Polygon":
+            polys.append(sp)
+        elif sp.geom_type == "MultiPolygon":
+            polys.extend(sp.geoms)
+    if not polys:
+        return None
+
+    # Letters like A, B, D, O, P, Q, R have inner holes. Use polygon-in-polygon
+    # `within` rather than rep-point containment, because the representative
+    # point of the outer glyph can fall inside the hole geometrically.
+    depths = []
+    for i, p in enumerate(polys):
+        depth = sum(1 for j, q in enumerate(polys) if i != j and p.within(q))
+        depths.append(depth)
+
+    outers = [p for p, d in zip(polys, depths) if d % 2 == 0]
+    holes = [p for p, d in zip(polys, depths) if d % 2 == 1]
+
+    if not outers:
+        return None
+
+    outer_union = unary_union(outers)
+    if holes:
+        outer_union = outer_union.difference(unary_union(holes))
+    return outer_union
+
+
+def _text_mesh_for_face(label: str, face_poly, dowel_positions: list[tuple[float, float]],
+                        largest_dowel_diam: float, engrave_depth: float
+                        ) -> tuple[trimesh.Trimesh | None, tuple[float, float] | None, float]:
+    """Build a 3D mesh of extruded text for engraving into a cut face.
+
+    Returns (mesh, position_2d, chosen_size_mm) or (None, None, 0.0) if nothing
+    readable fits.
+
+    Strategy: try several (exclusion_radius, fill_ratio) combinations in order
+    from strict to permissive. A permissive pass may place text overlapping a
+    dowel hole, which is acceptable — the hole takes priority and you still
+    see most of the letter around it.
+    """
+    if face_poly.is_empty:
+        return None, None, 0.0
+
+    from shapely.affinity import translate as shp_translate
+
+    # (exclusion radius multiplier on dowel diam, text fill ratio within region)
+    attempts = [
+        (1.2, 0.7),   # strict: big exclusion, text fills 70% of region
+        (0.9, 0.6),   # looser exclusion
+        (0.0, 0.55),  # no exclusion (letter may overlap holes)
+        (0.0, 0.40),  # final fallback: smaller text, no exclusion
+    ]
+
+    for excl_mult, fill_ratio in attempts:
+        exclusion_r = largest_dowel_diam * excl_mult if excl_mult > 0 else 0.0
+        free = face_poly
+        if exclusion_r > 0:
+            for (u, v) in dowel_positions:
+                try:
+                    free = free.difference(
+                        sg.Point(u, v).buffer(exclusion_r, resolution=16)
+                    )
+                except Exception:
+                    pass
+            if free.is_empty:
+                continue
+
+        regions = [free] if free.geom_type == "Polygon" else list(free.geoms)
+        regions = [r for r in regions if not r.is_empty]
+        if not regions:
+            continue
+        target = max(regions, key=lambda r: r.area)
+
+        minx, miny, maxx, maxy = target.bounds
+        w, h = maxx - minx, maxy - miny
+        char_width_ratio = 0.6
+        fit_by_h = h * fill_ratio
+        fit_by_w = (w * fill_ratio) / (char_width_ratio * max(1, len(label)))
+        size = min(fit_by_h, fit_by_w, MARK_TEXT_HEIGHT_MAX_MM)
+        if size < MARK_TEXT_HEIGHT_MIN_MM:
+            continue
+
+        rep = target.representative_point()
+        cx, cy = rep.x, rep.y
+
+        poly_2d = _text_to_polygon(label, size)
+        if poly_2d is None or poly_2d.is_empty:
+            continue
+
+        tminx, tminy, tmaxx, tmaxy = poly_2d.bounds
+        dx = cx - (tminx + tmaxx) / 2.0
+        dy = cy - (tminy + tmaxy) / 2.0
+        poly_2d = shp_translate(poly_2d, xoff=dx, yoff=dy)
+
+        # Skip if the text would mostly lie outside the face material —
+        # otherwise it's a wasted op (parts of the letter would just hang in
+        # air). Don't actually clip; clipped shapes can produce degenerate
+        # extrusions that break later booleans.
+        try:
+            inside = poly_2d.intersection(face_poly).area
+        except Exception:
+            inside = poly_2d.area
+        if inside < poly_2d.area * 0.5:
+            continue
+
+        try:
+            mesh = trimesh.creation.extrude_polygon(poly_2d, height=2 * engrave_depth)
+        except Exception:
+            continue
+        mesh.apply_translation([0.0, 0.0, -engrave_depth])
+        return mesh, (cx, cy), size
+
+    return None, None, 0.0
+
+
 def drill_dowel_holes(
     pieces: dict[tuple[int, int, int], trimesh.Trimesh],
     divisions: tuple[int, int, int],
     cell_size: tuple[float, float, float],
     allowed_sizes: list[tuple[str, float]],
+    add_markings: bool = True,
 ) -> tuple[dict[tuple[int, int, int], trimesh.Trimesh], list[dict]]:
     """
     For every interior grid plane, pick the best dowel size per shared face
-    from `allowed_sizes`, place the dowel pattern, and subtract the cylinders
-    from both adjacent pieces.
+    from `allowed_sizes`, place the dowel pattern, and (optionally) engrave
+    a unique letter label into each face. All cuts (cylinders + text meshes)
+    are subtracted from the adjacent pieces in one boolean per piece at the end.
 
-    Returns (updated pieces dict, list of face records). Each face record is:
-      {axis, plane_coord, cells: (key_lo, key_hi), size_label, diam_mm, count}
+    Returns (updated pieces dict, list of face records). Each face record:
+      {axis, plane_coord, cells, size_label, diam_mm, count, area_mm2, mark}
     """
     per_piece: dict[tuple[int, int, int], list[trimesh.Trimesh]] = defaultdict(list)
     face_records: list[dict] = []
+
+    # Assign labels in a deterministic axis-major order
+    face_index = 0
 
     for axis in range(3):
         other = [a for a in range(3) if a != axis]
@@ -467,36 +624,55 @@ def drill_dowel_holes(
                         continue
                     poly, T = res
 
-                    label, diam, pts_2d = _select_dowel_for_face(poly, allowed_sizes)
-                    if not pts_2d:
-                        face_records.append({
-                            "axis": axis, "plane_coord": plane_coord,
-                            "cells": (key_lo, key_hi),
-                            "size_label": "—", "diam_mm": 0.0,
-                            "count": 0, "area_mm2": poly.area,
-                        })
-                        continue
+                    size_label, diam, pts_2d = _select_dowel_for_face(poly, allowed_sizes)
 
-                    hole_r = (diam + HOLE_CLEARANCE_MM) / 2.0
-                    cyl_len = diam * DOWEL_DEPTH_FACTOR * 2.0
-                    for (u, v) in pts_2d:
-                        pt_world = (T @ np.array([u, v, 0.0, 1.0]))[:3]
-                        cyl = _make_cylinder_world(pt_world, axis, hole_r, cyl_len)
-                        per_piece[key_lo].append(cyl)
-                        per_piece[key_hi].append(cyl)
+                    # Allocate the next label no matter what — we'll still try to
+                    # engrave even if the face is too small for a dowel.
+                    mark = _label_for_index(face_index)
+                    face_index += 1
+
+                    # Dowel cylinders
+                    if pts_2d:
+                        hole_r = (diam + HOLE_CLEARANCE_MM) / 2.0
+                        cyl_len = diam * DOWEL_DEPTH_FACTOR * 2.0
+                        for (u, v) in pts_2d:
+                            pt_world = (T @ np.array([u, v, 0.0, 1.0]))[:3]
+                            cyl = _make_cylinder_world(pt_world, axis, hole_r, cyl_len)
+                            per_piece[key_lo].append(cyl)
+                            per_piece[key_hi].append(cyl)
+
+                    # Text engraving (subtracted on both sides so both pieces get
+                    # a mirrored version of the same letter — matching halves).
+                    mark_engraved = False
+                    if add_markings:
+                        text_mesh, _pos, text_size = _text_mesh_for_face(
+                            mark, poly, pts_2d, diam if diam else 10.0,
+                            MARK_ENGRAVE_DEPTH_MM,
+                        )
+                        if text_mesh is not None:
+                            text_mesh.apply_transform(T)
+                            per_piece[key_lo].append(text_mesh)
+                            per_piece[key_hi].append(text_mesh)
+                            mark_engraved = True
 
                     face_records.append({
                         "axis": axis, "plane_coord": plane_coord,
                         "cells": (key_lo, key_hi),
-                        "size_label": label, "diam_mm": diam,
-                        "count": len(pts_2d), "area_mm2": poly.area,
+                        "size_label": size_label if pts_2d else "-",
+                        "diam_mm": diam if pts_2d else 0.0,
+                        "count": len(pts_2d),
+                        "area_mm2": poly.area,
+                        "mark": mark if mark_engraved else "-",
                     })
 
     n_total = sum(r["count"] for r in face_records)
-    n_faces = sum(1 for r in face_records if r["count"] > 0)
+    n_drilled = sum(1 for r in face_records if r["count"] > 0)
     n_empty = sum(1 for r in face_records if r["count"] == 0)
-    print(f"  {n_faces} shared face(s) drilled, {n_total} dowel hole(s) total"
+    n_marks = sum(1 for r in face_records if r["mark"] != "-")
+    print(f"  {n_drilled} shared face(s) drilled, {n_total} dowel hole(s) total"
           + (f"  ({n_empty} face(s) too small for any dowel)" if n_empty else ""))
+    if add_markings:
+        print(f"  engraved {n_marks}/{len(face_records)} face labels")
 
     # Per-size summary
     by_size: dict[tuple[str, float], int] = defaultdict(int)
@@ -508,19 +684,25 @@ def drill_dowel_holes(
 
     out: dict[tuple[int, int, int], trimesh.Trimesh] = {}
     for key, piece in pieces.items():
-        cyls = per_piece.get(key, [])
-        if not cyls:
+        subs = per_piece.get(key, [])
+        if not subs:
             out[key] = piece
             continue
         try:
-            res = trimesh.boolean.difference([piece, *cyls])
+            res = trimesh.boolean.difference([piece, *subs])
             if res is None or len(res.vertices) == 0:
-                print(f"  WARNING: drill returned empty for {key} - keeping original")
+                print(f"  WARNING: boolean returned empty for {key} - keeping original")
                 out[key] = piece
             else:
+                # Clean up boolean output so slicers don't choke on hairline
+                # non-manifold edges left by the extrusion stamps.
+                res.merge_vertices()
+                res.remove_unreferenced_vertices()
+                if not res.is_watertight:
+                    res.fill_holes()
                 out[key] = res
         except Exception as e:
-            print(f"  WARNING: drill failed for {key}: {e} - keeping original")
+            print(f"  WARNING: boolean failed for {key}: {e} - keeping original")
             out[key] = piece
     return out, face_records
 
@@ -718,13 +900,16 @@ Dowel shopping list
         txt += f"  {path.name:40s}  cell ({key[0]},{key[1]},{key[2]})  {vol:7.1f} cm^3\n"
 
     txt += "\nPer-face breakdown\n------------------\n"
-    txt += "  axis  plane_mm    cells                    size     dowels   face_area_cm2\n"
+    txt += "  mark  axis  plane_mm    cells                       size    dowels   face_area_cm2\n"
     axis_name = ("X", "Y", "Z")
     for fr in face_records:
         lo, hi = fr["cells"]
-        txt += (f"  {axis_name[fr['axis']]}     {fr['plane_coord']:7.1f}  "
-                f"{str(lo):<10s} <-> {str(hi):<10s}  "
+        txt += (f"  {fr['mark']:>4s}  {axis_name[fr['axis']]}     {fr['plane_coord']:7.1f}  "
+                f"{str(lo):<11s} <-> {str(hi):<11s} "
                 f"{fr['size_label']:>7s}  {fr['count']:>5d}    {fr['area_mm2']/100.0:7.1f}\n")
+
+    txt += "\nAssembly tip: matching faces share the same letter. Find the two\n"
+    txt += "pieces whose cut faces both show 'A', mate them; then 'B', and so on.\n"
 
     out_path.write_text(txt, encoding="utf-8")
 
@@ -738,6 +923,7 @@ def run(
     hollow: bool,
     allowed_sizes: list[tuple[str, float]],
     output_dir: Path,
+    add_markings: bool = True,
 ) -> None:
 
     safe_volume = tuple(v * (1.0 - PRINT_SAFETY_FRACTION) for v in print_volume)
@@ -756,6 +942,7 @@ def run(
           f"(cells ~{cell_size[0]:.1f} x {cell_size[1]:.1f} x {cell_size[2]:.1f} mm)")
     print(f"  hollow:         {hollow}")
     print(f"  dowel set:      {dowel_desc}")
+    print(f"  wall markings:  {'yes (0.6 mm engraved letters)' if add_markings else 'no'}")
     print(f"  output:         {output_dir}")
     print("-------------------------------------------------")
 
@@ -773,8 +960,10 @@ def run(
         print("ERROR: no non-empty pieces produced. Abort.")
         sys.exit(1)
 
-    print("\n[4/5] Drilling dowel holes on shared cut faces")
-    pieces, face_records = drill_dowel_holes(pieces, divisions, cell_size, allowed_sizes)
+    print("\n[4/5] Drilling dowel holes + engraving wall markings")
+    pieces, face_records = drill_dowel_holes(
+        pieces, divisions, cell_size, allowed_sizes, add_markings=add_markings,
+    )
 
     if hollow:
         print("      adding 4 mm vent holes for hollow printing")
@@ -815,6 +1004,10 @@ def interactive(input_path: Path) -> None:
           f"(cell ~{cell_size[0]:.0f}x{cell_size[1]:.0f}x{cell_size[2]:.0f} mm)")
 
     hollow = _prompt_yn("\nHollow pieces? (0% infill + vent hole)", default=False)
+    add_markings = _prompt_yn(
+        "Engrave matching letter on each pair of cut faces? (helps assembly)",
+        default=True,
+    )
     allowed_sizes = _prompt_dowel_set(cell_size)
 
     raw = input("\nOutput directory [./split_output]: ").strip()
@@ -825,7 +1018,8 @@ def interactive(input_path: Path) -> None:
             print("aborted")
             return
 
-    run(input_path, target, print_volume, hollow, allowed_sizes, output_dir)
+    run(input_path, target, print_volume, hollow, allowed_sizes, output_dir,
+        add_markings=add_markings)
 
 
 def main() -> None:
@@ -848,6 +1042,9 @@ def main() -> None:
                         help="Printer build volume in mm (default 250 250 250)")
     parser.add_argument("--hollow", action="store_true",
                         help="Hollow mode (0%% infill + 4 mm vent hole per piece)")
+    parser.add_argument("--no-markings", action="store_true",
+                        help="Do NOT engrave letter labels on cut faces "
+                              "(by default, matching faces get the same letter A/B/C/... to aid assembly)")
     parser.add_argument("--dowel-sizes", type=str, default=None,
                         help=("Comma-separated dowel sizes (mm, indices 1-9 "
                               "of standard list, or fractions like 1/4,3/8,1/2). "
@@ -887,7 +1084,8 @@ def main() -> None:
     else:
         allowed = _default_dowel_set(cell_size)
 
-    run(input_path, target, print_volume, args.hollow, allowed, Path(args.output))
+    run(input_path, target, print_volume, args.hollow, allowed, Path(args.output),
+        add_markings=not args.no_markings)
 
 
 if __name__ == "__main__":

@@ -5,9 +5,11 @@ from PyInstaller.utils.hooks import collect_submodules
 datas = []
 hiddenimports = []
 datas += collect_data_files('trimesh')
+datas += collect_data_files('matplotlib')
 hiddenimports += collect_submodules('trimesh')
 hiddenimports += collect_submodules('manifold3d')
 hiddenimports += collect_submodules('shapely')
+hiddenimports += collect_submodules('matplotlib')
 
 
 a = Analysis(

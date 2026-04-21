@@ -3,6 +3,7 @@ trimesh
 manifold3d
 shapely
 pillow
+matplotlib
 rtree
 networkx
 lxml
