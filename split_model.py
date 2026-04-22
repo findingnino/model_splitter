@@ -55,7 +55,7 @@ STANDARD_DOWELS: list[tuple[str, float]] = [
     ("1\"",    25.4),
 ]
 
-HOLE_CLEARANCE_MM       = 0.4    # hole dia = dowel dia + this (slip fit)
+DEFAULT_HOLE_CLEARANCE_MM = 0.4  # hole dia = dowel dia + this (slip fit). Override via --hole-clearance.
 DOWEL_DEPTH_FACTOR      = 2.0    # ideal hole depth into each piece = this * dowel dia
 DOWEL_THROUGH_SAFETY_MM = 2.0    # leave at least this much wall between hole bottom and exterior
 DOWEL_MIN_DEPTH_FACTOR  = 0.5    # don't bother with a dowel if each side is shorter than this * dia
@@ -688,6 +688,7 @@ def drill_dowel_holes(
     cell_size: tuple[float, float, float],
     allowed_sizes: list[tuple[str, float]],
     add_markings: bool = True,
+    hole_clearance_mm: float = DEFAULT_HOLE_CLEARANCE_MM,
 ) -> tuple[dict[tuple[int, int, int], trimesh.Trimesh], list[dict]]:
     """
     For every interior grid plane, pick the best dowel size per shared face
@@ -737,7 +738,7 @@ def drill_dowel_holes(
                     # exterior wall.
                     dowel_lengths_this_face: list[float] = []
                     if pts_2d:
-                        hole_r = (diam + HOLE_CLEARANCE_MM) / 2.0
+                        hole_r = (diam + hole_clearance_mm) / 2.0
                         ideal_depth = diam * DOWEL_DEPTH_FACTOR
                         min_depth = diam * DOWEL_MIN_DEPTH_FACTOR
                         for (u, v) in pts_2d:
@@ -1049,6 +1050,7 @@ def run(
     output_dir: Path,
     add_markings: bool = True,
     skip_confirm: bool = False,
+    hole_clearance_mm: float = DEFAULT_HOLE_CLEARANCE_MM,
 ) -> None:
 
     safe_volume = tuple(v * (1.0 - PRINT_SAFETY_FRACTION) for v in print_volume)
@@ -1067,6 +1069,7 @@ def run(
           f"(cells ~{cell_size[0]:.1f} x {cell_size[1]:.1f} x {cell_size[2]:.1f} mm)")
     print(f"  hollow:         {hollow}")
     print(f"  dowel set:      {dowel_desc}")
+    print(f"  hole clearance: {hole_clearance_mm:.2f} mm (hole dia = dowel dia + this)")
     print(f"  wall markings:  {'yes (0.6 mm engraved letters)' if add_markings else 'no'}")
     print(f"  output:         {output_dir}")
     print("-------------------------------------------------")
@@ -1118,7 +1121,8 @@ def run(
 
     print("\n[5/6] Drilling dowel holes + engraving wall markings")
     pieces, face_records = drill_dowel_holes(
-        pieces, divisions, cell_size, allowed_sizes, add_markings=add_markings,
+        pieces, divisions, cell_size, allowed_sizes,
+        add_markings=add_markings, hole_clearance_mm=hole_clearance_mm,
     )
 
     if hollow:
@@ -1166,6 +1170,22 @@ def interactive(input_path: Path) -> None:
     )
     allowed_sizes = _prompt_dowel_set(cell_size)
 
+    while True:
+        raw = input(f"\nHole clearance in mm (dowel dia + this = hole dia; "
+                    f"increase for loose prints, decrease for tight) "
+                    f"[{DEFAULT_HOLE_CLEARANCE_MM}]: ").strip()
+        if not raw:
+            hole_clearance = DEFAULT_HOLE_CLEARANCE_MM
+            break
+        try:
+            hole_clearance = float(raw)
+            if hole_clearance < 0:
+                print("  must be >= 0")
+                continue
+            break
+        except ValueError:
+            print("  couldn't parse as a number")
+
     raw = input("\nOutput directory [./split_output]: ").strip()
     output_dir = Path(raw) if raw else Path("./split_output")
 
@@ -1175,7 +1195,8 @@ def interactive(input_path: Path) -> None:
             return
 
     run(input_path, target, print_volume, hollow, allowed_sizes, output_dir,
-        add_markings=add_markings, skip_confirm=False)
+        add_markings=add_markings, skip_confirm=False,
+        hole_clearance_mm=hole_clearance)
 
 
 def main() -> None:
@@ -1203,6 +1224,12 @@ def main() -> None:
                               "(by default, matching faces get the same letter A/B/C/... to aid assembly)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip the piece-count confirmation prompt (proceed automatically)")
+    parser.add_argument("--hole-clearance", type=float, default=DEFAULT_HOLE_CLEARANCE_MM,
+                        metavar="MM",
+                        help=(f"Diametral clearance added to dowel diameter when drilling the "
+                              f"hole (default {DEFAULT_HOLE_CLEARANCE_MM} mm). Increase for "
+                              "loose-printing printers / cheap filament (e.g. 0.6), decrease "
+                              "for well-calibrated printers (e.g. 0.2)."))
     parser.add_argument("--dowel-sizes", type=str, default=None,
                         help=("Comma-separated dowel sizes (mm, indices 1-9 "
                               "of standard list, or fractions like 1/4,3/8,1/2). "
@@ -1243,7 +1270,8 @@ def main() -> None:
         allowed = _default_dowel_set(cell_size)
 
     run(input_path, target, print_volume, args.hollow, allowed, Path(args.output),
-        add_markings=not args.no_markings, skip_confirm=args.yes)
+        add_markings=not args.no_markings, skip_confirm=args.yes,
+        hole_clearance_mm=args.hole_clearance)
 
 
 if __name__ == "__main__":
