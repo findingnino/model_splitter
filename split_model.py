@@ -56,7 +56,9 @@ STANDARD_DOWELS: list[tuple[str, float]] = [
 ]
 
 HOLE_CLEARANCE_MM       = 0.4    # hole dia = dowel dia + this (slip fit)
-DOWEL_DEPTH_FACTOR      = 2.0    # hole depth into each piece = this * dowel dia
+DOWEL_DEPTH_FACTOR      = 2.0    # ideal hole depth into each piece = this * dowel dia
+DOWEL_THROUGH_SAFETY_MM = 2.0    # leave at least this much wall between hole bottom and exterior
+DOWEL_MIN_DEPTH_FACTOR  = 0.5    # don't bother with a dowel if each side is shorter than this * dia
 DOWEL_WALL_MARGIN_MM    = 1.5    # min wall thickness between dowel and cut edge
 DOWEL_SPACING_FACTOR    = 3.0    # minimum center-to-center distance = this * dia
 MIN_DOWELS_PER_FACE     = 2      # target at least this many per shared face for alignment
@@ -254,33 +256,80 @@ def _cell_box(origin: tuple[float, float, float], size: tuple[float, float, floa
     return b
 
 
+def estimate_occupied_cells(
+    mesh: trimesh.Trimesh,
+    divisions: tuple[int, int, int],
+) -> tuple[set[tuple[int, int, int]], float, float]:
+    """Voxel-pre-compute which grid cells actually contain mesh material.
+
+    Uses the mesh in its current coord system. Voxelizes at a pitch fine
+    enough to resolve each cell well (~10 voxels per cell side), then buckets
+    voxels into the grid.
+
+    Returns (occupied_cells_set, mesh_volume_mm3_in_current_coords, pitch_mm).
+    Also used by `cut_into_pieces` to skip the expensive boolean on cells
+    that have no material.
+    """
+    ext = mesh.extents
+    cell_ext = tuple(ext[i] / divisions[i] for i in range(3))
+    pitch = max(0.3, min(5.0, min(cell_ext) / 10.0))
+
+    vox = mesh.voxelized(pitch=pitch)
+    try:
+        vox = vox.fill()
+    except Exception:
+        # `fill` occasionally fails on odd topologies; surface voxels alone are fine
+        pass
+    matrix = vox.matrix
+
+    bx = np.linspace(0, matrix.shape[0], divisions[0] + 1).astype(int)
+    by = np.linspace(0, matrix.shape[1], divisions[1] + 1).astype(int)
+    bz = np.linspace(0, matrix.shape[2], divisions[2] + 1).astype(int)
+
+    occupied: set[tuple[int, int, int]] = set()
+    for ix in range(divisions[0]):
+        for iy in range(divisions[1]):
+            for iz in range(divisions[2]):
+                sub = matrix[bx[ix]:bx[ix + 1], by[iy]:by[iy + 1], bz[iz]:bz[iz + 1]]
+                if sub.any():
+                    occupied.add((ix, iy, iz))
+
+    volume_mm3 = float(matrix.sum()) * (pitch ** 3)
+    return occupied, volume_mm3, pitch
+
+
 def cut_into_pieces(
     mesh: trimesh.Trimesh,
     divisions: tuple[int, int, int],
     cell_size: tuple[float, float, float],
+    occupied_cells: set[tuple[int, int, int]] | None = None,
 ) -> dict[tuple[int, int, int], trimesh.Trimesh]:
     pieces: dict[tuple[int, int, int], trimesh.Trimesh] = {}
-    total = divisions[0] * divisions[1] * divisions[2]
-    n = 0
-    for ix in range(divisions[0]):
-        for iy in range(divisions[1]):
-            for iz in range(divisions[2]):
-                n += 1
-                origin = (ix * cell_size[0], iy * cell_size[1], iz * cell_size[2])
-                box = _cell_box(origin, cell_size)
-                try:
-                    piece = mesh.intersection(box)
-                except Exception as e:
-                    print(f"  [{n:>3}/{total}] ({ix},{iy},{iz}) intersection failed: {e}")
-                    continue
-                if piece is None or len(piece.vertices) == 0:
-                    continue
-                vol = piece.volume if piece.is_volume else 0.0
-                if vol < MIN_PIECE_VOLUME_MM3:
-                    continue
-                pieces[(ix, iy, iz)] = piece
-                print(f"  [{n:>3}/{total}] ({ix},{iy},{iz}) "
-                      f"{len(piece.vertices):>6,} v   vol={vol/1000:7.1f} cm³")
+    if occupied_cells is None:
+        to_process = [(ix, iy, iz)
+                      for ix in range(divisions[0])
+                      for iy in range(divisions[1])
+                      for iz in range(divisions[2])]
+    else:
+        to_process = sorted(occupied_cells)
+    total = len(to_process)
+
+    for n, (ix, iy, iz) in enumerate(to_process, start=1):
+        origin = (ix * cell_size[0], iy * cell_size[1], iz * cell_size[2])
+        box = _cell_box(origin, cell_size)
+        try:
+            piece = mesh.intersection(box)
+        except Exception as e:
+            print(f"  [{n:>3}/{total}] ({ix},{iy},{iz}) intersection failed: {e}")
+            continue
+        if piece is None or len(piece.vertices) == 0:
+            continue
+        vol = piece.volume if piece.is_volume else 0.0
+        if vol < MIN_PIECE_VOLUME_MM3:
+            continue
+        pieces[(ix, iy, iz)] = piece
+        print(f"  [{n:>3}/{total}] ({ix},{iy},{iz}) "
+              f"{len(piece.vertices):>6,} v   vol={vol/1000:7.1f} cm³")
     return pieces
 
 
@@ -435,6 +484,33 @@ def _make_cylinder_world(center_xyz: np.ndarray, axis: int,
     return cyl
 
 
+def _safe_half_depth(piece: trimesh.Trimesh, pt_world: np.ndarray,
+                     axis: int, sign: int, ideal_depth: float) -> float:
+    """Max depth the hole can penetrate into `piece` from `pt_world` along
+    sign*axis before hitting the piece's opposite exterior wall.
+
+    Shoots a ray from pt_world along `sign*axis`; if the ray exits the piece
+    closer than `ideal_depth + safety`, shortens the hole accordingly.
+    """
+    direction = np.zeros(3)
+    direction[axis] = float(sign)
+    # Small step into the piece so the ray doesn't self-intersect the cut face
+    origin = pt_world + direction * 0.3
+    try:
+        locations = piece.ray.intersects_location(
+            ray_origins=np.array([origin]),
+            ray_directions=np.array([direction]),
+        )[0]
+    except Exception:
+        return ideal_depth
+    if len(locations) == 0:
+        # Ray didn't find an exit wall — treat as safe
+        return ideal_depth
+    dists = np.linalg.norm(locations - origin, axis=1)
+    wall_distance = float(np.min(dists))
+    return min(ideal_depth, max(0.0, wall_distance - DOWEL_THROUGH_SAFETY_MM))
+
+
 # ---------- wall-marking labels ----------
 
 def _label_for_index(i: int) -> str:
@@ -496,83 +572,108 @@ def _text_to_polygon(text: str, size_mm: float):
 def _text_mesh_for_face(label: str, face_poly, dowel_positions: list[tuple[float, float]],
                         largest_dowel_diam: float, engrave_depth: float
                         ) -> tuple[trimesh.Trimesh | None, tuple[float, float] | None, float]:
-    """Build a 3D mesh of extruded text for engraving into a cut face.
+    """Build an extruded-text mesh for engraving into a cut face.
 
-    Returns (mesh, position_2d, chosen_size_mm) or (None, None, 0.0) if nothing
-    readable fits.
+    Uses shapely's `polylabel` (pole of inaccessibility = center of the largest
+    inscribed circle) to find the best interior point, then sizes the text to
+    fit that circle. Tries with a dowel-exclusion mask first, then without.
 
-    Strategy: try several (exclusion_radius, fill_ratio) combinations in order
-    from strict to permissive. A permissive pass may place text overlapping a
-    dowel hole, which is acceptable — the hole takes priority and you still
-    see most of the letter around it.
+    Returns (mesh_local_to_plane, position_2d, size_mm) or (None, None, 0.0).
     """
     if face_poly.is_empty:
         return None, None, 0.0
 
+    from shapely.ops import polylabel
     from shapely.affinity import translate as shp_translate
 
-    # (exclusion radius multiplier on dowel diam, text fill ratio within region)
-    attempts = [
-        (1.2, 0.7),   # strict: big exclusion, text fills 70% of region
-        (0.9, 0.6),   # looser exclusion
-        (0.0, 0.55),  # no exclusion (letter may overlap holes)
-        (0.0, 0.40),  # final fallback: smaller text, no exclusion
-    ]
+    char_width_ratio = 0.6   # approximate glyph width / height for DejaVu Sans
 
-    for excl_mult, fill_ratio in attempts:
-        exclusion_r = largest_dowel_diam * excl_mult if excl_mult > 0 else 0.0
+    # Try: (a) exclude dowel footprints, (b) ignore dowel footprints.
+    exclusion_radii = [max(largest_dowel_diam * 1.0, 4.0), 0.0]
+
+    for exclusion_r in exclusion_radii:
         free = face_poly
         if exclusion_r > 0:
             for (u, v) in dowel_positions:
                 try:
-                    free = free.difference(
-                        sg.Point(u, v).buffer(exclusion_r, resolution=16)
-                    )
+                    free = free.difference(sg.Point(u, v).buffer(exclusion_r, resolution=12))
                 except Exception:
                     pass
             if free.is_empty:
                 continue
 
         regions = [free] if free.geom_type == "Polygon" else list(free.geoms)
-        regions = [r for r in regions if not r.is_empty]
+        regions = [r for r in regions if not r.is_empty and r.area > MARK_TEXT_HEIGHT_MIN_MM ** 2]
         if not regions:
             continue
-        target = max(regions, key=lambda r: r.area)
 
-        minx, miny, maxx, maxy = target.bounds
-        w, h = maxx - minx, maxy - miny
-        char_width_ratio = 0.6
-        fit_by_h = h * fill_ratio
-        fit_by_w = (w * fill_ratio) / (char_width_ratio * max(1, len(label)))
-        size = min(fit_by_h, fit_by_w, MARK_TEXT_HEIGHT_MAX_MM)
-        if size < MARK_TEXT_HEIGHT_MIN_MM:
+        # Pick the region whose largest inscribed circle is the biggest —
+        # that's the safest place to put a centered label.
+        best_pole = None
+        best_radius = 0.0
+        for region in regions:
+            try:
+                tol = max(0.3, min(2.0, region.area ** 0.5 / 30.0))
+                pole = polylabel(region, tolerance=tol)
+                radius = float(pole.distance(region.boundary))
+            except Exception:
+                rep = region.representative_point()
+                pole = rep
+                try:
+                    radius = float(rep.distance(region.boundary))
+                except Exception:
+                    radius = 0.0
+            if radius > best_radius:
+                best_radius = radius
+                best_pole = pole
+
+        if best_pole is None or best_radius < MARK_TEXT_HEIGHT_MIN_MM / 2.0:
             continue
 
-        rep = target.representative_point()
-        cx, cy = rep.x, rep.y
+        # Fit text in the inscribed circle. Height bounded by circle diameter
+        # and by width needed for the letter count.
+        max_by_height = 2 * best_radius * 0.85
+        max_by_width = (2 * best_radius * 0.95) / (char_width_ratio * max(1, len(label)))
+        size = min(max_by_height, max_by_width, MARK_TEXT_HEIGHT_MAX_MM)
+        if size < MARK_TEXT_HEIGHT_MIN_MM:
+            continue
 
         poly_2d = _text_to_polygon(label, size)
         if poly_2d is None or poly_2d.is_empty:
             continue
 
+        cx, cy = best_pole.x, best_pole.y
         tminx, tminy, tmaxx, tmaxy = poly_2d.bounds
-        dx = cx - (tminx + tmaxx) / 2.0
-        dy = cy - (tminy + tmaxy) / 2.0
-        poly_2d = shp_translate(poly_2d, xoff=dx, yoff=dy)
+        poly_2d = shp_translate(
+            poly_2d,
+            xoff=cx - (tminx + tmaxx) / 2.0,
+            yoff=cy - (tminy + tmaxy) / 2.0,
+        )
 
-        # Skip if the text would mostly lie outside the face material —
-        # otherwise it's a wasted op (parts of the letter would just hang in
-        # air). Don't actually clip; clipped shapes can produce degenerate
-        # extrusions that break later booleans.
+        # Must sit on the face material. Dowel overlap is OK (hole takes priority).
         try:
             inside = poly_2d.intersection(face_poly).area
         except Exception:
             inside = poly_2d.area
-        if inside < poly_2d.area * 0.5:
+        if inside < poly_2d.area * 0.7:
             continue
 
+        # Multi-character labels produce MultiPolygons (one Polygon per glyph);
+        # extrude_polygon only handles a single Polygon, so extrude per-glyph
+        # and concatenate into one mesh.
         try:
-            mesh = trimesh.creation.extrude_polygon(poly_2d, height=2 * engrave_depth)
+            if poly_2d.geom_type == "MultiPolygon":
+                parts = []
+                for sub in poly_2d.geoms:
+                    if sub.is_empty:
+                        continue
+                    parts.append(trimesh.creation.extrude_polygon(
+                        sub, height=2 * engrave_depth))
+                if not parts:
+                    continue
+                mesh = trimesh.util.concatenate(parts)
+            else:
+                mesh = trimesh.creation.extrude_polygon(poly_2d, height=2 * engrave_depth)
         except Exception:
             continue
         mesh.apply_translation([0.0, 0.0, -engrave_depth])
@@ -631,15 +732,28 @@ def drill_dowel_holes(
                     mark = _label_for_index(face_index)
                     face_index += 1
 
-                    # Dowel cylinders
+                    # Dowel cylinders — per-position length, capped by a ray
+                    # cast so the hole never punches through either piece's
+                    # exterior wall.
+                    dowel_lengths_this_face: list[float] = []
                     if pts_2d:
                         hole_r = (diam + HOLE_CLEARANCE_MM) / 2.0
-                        cyl_len = diam * DOWEL_DEPTH_FACTOR * 2.0
+                        ideal_depth = diam * DOWEL_DEPTH_FACTOR
+                        min_depth = diam * DOWEL_MIN_DEPTH_FACTOR
                         for (u, v) in pts_2d:
                             pt_world = (T @ np.array([u, v, 0.0, 1.0]))[:3]
+                            depth_lo = _safe_half_depth(pieces[key_lo], pt_world, axis, -1, ideal_depth)
+                            depth_hi = _safe_half_depth(pieces[key_hi], pt_world, axis, +1, ideal_depth)
+                            safe_depth = min(depth_lo, depth_hi)
+                            if safe_depth < min_depth:
+                                # Hole would be too shallow to add meaningful
+                                # alignment — drop this dowel.
+                                continue
+                            cyl_len = safe_depth * 2.0
                             cyl = _make_cylinder_world(pt_world, axis, hole_r, cyl_len)
                             per_piece[key_lo].append(cyl)
                             per_piece[key_hi].append(cyl)
+                            dowel_lengths_this_face.append(cyl_len)
 
                     # Text engraving (subtracted on both sides so both pieces get
                     # a mirrored version of the same letter — matching halves).
@@ -655,12 +769,14 @@ def drill_dowel_holes(
                             per_piece[key_hi].append(text_mesh)
                             mark_engraved = True
 
+                    placed_count = len(dowel_lengths_this_face)
                     face_records.append({
                         "axis": axis, "plane_coord": plane_coord,
                         "cells": (key_lo, key_hi),
-                        "size_label": size_label if pts_2d else "-",
-                        "diam_mm": diam if pts_2d else 0.0,
-                        "count": len(pts_2d),
+                        "size_label": size_label if placed_count else "-",
+                        "diam_mm": diam if placed_count else 0.0,
+                        "count": placed_count,
+                        "dowel_lengths": dowel_lengths_this_face,
                         "area_mm2": poly.area,
                         "mark": mark if mark_engraved else "-",
                     })
@@ -829,17 +945,19 @@ def write_readme(
     total_vol = sum(r[2] for r in records)
     allowed_desc = ", ".join(f"{lbl} ({mm:.3f} mm)" for lbl, mm in allowed_sizes)
 
-    # Tally dowels by size
-    by_size: dict[tuple[str, float], int] = defaultdict(int)
+    # Tally dowels by size, tracking per-dowel length (may vary by face when
+    # a piece was too thin for the ideal depth)
+    by_size: dict[tuple[str, float], list[float]] = defaultdict(list)
     faces_drilled = 0
     faces_too_small = 0
     for fr in face_records:
         if fr["count"] > 0:
-            by_size[(fr["size_label"], fr["diam_mm"])] += fr["count"]
+            lens = fr.get("dowel_lengths", [])
+            by_size[(fr["size_label"], fr["diam_mm"])].extend(lens)
             faces_drilled += 1
         else:
             faces_too_small += 1
-    total_dowels = sum(by_size.values())
+    total_dowels = sum(len(v) for v in by_size.values())
 
     txt = f"""\
 Model Splitter - build instructions
@@ -865,11 +983,17 @@ Dowel shopping list
     if not by_size:
         txt += "  (no dowels placed)\n"
     else:
-        for (lbl, diam), n in sorted(by_size.items(), key=lambda kv: kv[0][1]):
-            cut_len = diam * DOWEL_DEPTH_FACTOR * 2 + 1.0
-            txt += (f"  {lbl:8s} ({diam:6.3f} mm dia): "
-                    f"cut {n} pieces at {cut_len:.0f} mm each "
-                    f"(~{n * cut_len / 25.4:.1f} in total length required)\n")
+        for (lbl, diam), lens in sorted(by_size.items(), key=lambda kv: kv[0][1]):
+            n = len(lens)
+            # Dowels are cut per-hole because some pieces are too thin for the
+            # ideal 4x-diameter length. Group by length bucket (nearest 5 mm).
+            buckets: dict[int, int] = defaultdict(int)
+            for L in lens:
+                buckets[int(round(L / 5.0)) * 5] += 1
+            total_in = sum(k * v for k, v in buckets.items()) / 25.4
+            txt += f"  {lbl:8s} ({diam:6.3f} mm dia): {n} dowels, ~{total_in:.1f} in total stock\n"
+            for length_mm, count in sorted(buckets.items()):
+                txt += f"      cut {count:>3d} at ~{length_mm} mm\n"
 
     txt += "\nSlicer recommendations\n----------------------\n"
     if hollow:
@@ -924,6 +1048,7 @@ def run(
     allowed_sizes: list[tuple[str, float]],
     output_dir: Path,
     add_markings: bool = True,
+    skip_confirm: bool = False,
 ) -> None:
 
     safe_volume = tuple(v * (1.0 - PRINT_SAFETY_FRACTION) for v in print_volume)
@@ -948,19 +1073,50 @@ def run(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[1/5] Loading & cleaning mesh")
+    print("\n[1/6] Loading & cleaning mesh")
     mesh = load_and_clean(input_path)
 
-    print("\n[2/5] Scaling to target bounding box")
+    print("\n[2/6] Scaling to target bounding box")
     mesh = scale_to_bbox(mesh, target)
 
-    print("\n[3/5] Cutting into grid cells (boolean intersections)")
-    pieces = cut_into_pieces(mesh, divisions, cell_size)
+    print("\n[3/6] Voxel pre-pass: finding occupied grid cells")
+    occupied, volume_mm3, pitch = estimate_occupied_cells(mesh, divisions)
+    total_cells = divisions[0] * divisions[1] * divisions[2]
+    volume_cm3 = volume_mm3 / 1000.0
+    pla_density = 1.24  # g/cc
+    mass_full = volume_cm3 * pla_density / 1000.0     # kg if printed 100% solid
+    mass_typical = mass_full * 0.30                    # 3 walls + 20% infill ~30% of solid
+    mass_hollow = mass_full * 0.08                     # hollow mode: 4 walls, 0% infill
+    print(f"  voxel pitch:          {pitch:.2f} mm")
+    print(f"  grid:                 {divisions[0]} x {divisions[1]} x {divisions[2]} = {total_cells} cells")
+    print(f"  cells with material:  {len(occupied)}  ({len(occupied)*100/total_cells:.0f}% of bbox)")
+    print(f"  cells to skip:        {total_cells - len(occupied)}  (no boolean ops on these)")
+    print(f"  mesh volume (scaled): {volume_cm3:,.1f} cm^3")
+    print(f"  filament (PLA):       ~{mass_full:,.1f} kg if printed solid (100% infill)")
+    print(f"                        ~{mass_typical:,.1f} kg at 3 walls + 20% infill (typical)")
+    print(f"                        ~{mass_hollow:,.1f} kg at hollow mode (4 walls, 0% infill)")
+
+    if not occupied:
+        print("ERROR: voxel pre-pass found no occupied cells. Abort.")
+        sys.exit(1)
+
+    if not skip_confirm:
+        ok = _prompt_yn(
+            f"\nProceed with cutting {len(occupied)} pieces? "
+            "(estimate - actual count may differ by a few)",
+            default=True,
+        )
+        if not ok:
+            print("aborted - no files written")
+            return
+
+    print("\n[4/6] Cutting into grid cells (boolean intersections)")
+    pieces = cut_into_pieces(mesh, divisions, cell_size, occupied_cells=occupied)
     if not pieces:
         print("ERROR: no non-empty pieces produced. Abort.")
         sys.exit(1)
 
-    print("\n[4/5] Drilling dowel holes + engraving wall markings")
+    print("\n[5/6] Drilling dowel holes + engraving wall markings")
     pieces, face_records = drill_dowel_holes(
         pieces, divisions, cell_size, allowed_sizes, add_markings=add_markings,
     )
@@ -969,7 +1125,7 @@ def run(
         print("      adding 4 mm vent holes for hollow printing")
         pieces = add_vent_holes(pieces)
 
-    print("\n[5/5] Exporting STLs, assembly diagram, README")
+    print("\n[6/6] Exporting STLs, assembly diagram, README")
     records = export_pieces(pieces, output_dir)
     write_assembly_map(records, divisions, cell_size, output_dir / "assembly_map.png")
     write_readme(
@@ -1019,7 +1175,7 @@ def interactive(input_path: Path) -> None:
             return
 
     run(input_path, target, print_volume, hollow, allowed_sizes, output_dir,
-        add_markings=add_markings)
+        add_markings=add_markings, skip_confirm=False)
 
 
 def main() -> None:
@@ -1045,6 +1201,8 @@ def main() -> None:
     parser.add_argument("--no-markings", action="store_true",
                         help="Do NOT engrave letter labels on cut faces "
                               "(by default, matching faces get the same letter A/B/C/... to aid assembly)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip the piece-count confirmation prompt (proceed automatically)")
     parser.add_argument("--dowel-sizes", type=str, default=None,
                         help=("Comma-separated dowel sizes (mm, indices 1-9 "
                               "of standard list, or fractions like 1/4,3/8,1/2). "
@@ -1085,7 +1243,7 @@ def main() -> None:
         allowed = _default_dowel_set(cell_size)
 
     run(input_path, target, print_volume, args.hollow, allowed, Path(args.output),
-        add_markings=not args.no_markings)
+        add_markings=not args.no_markings, skip_confirm=args.yes)
 
 
 if __name__ == "__main__":
