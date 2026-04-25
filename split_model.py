@@ -56,9 +56,10 @@ STANDARD_DOWELS: list[tuple[str, float]] = [
 ]
 
 DEFAULT_HOLE_CLEARANCE_MM = 0.4  # hole dia = dowel dia + this (slip fit). Override via --hole-clearance.
-DOWEL_DEPTH_FACTOR      = 2.0    # ideal hole depth into each piece = this * dowel dia
-DOWEL_THROUGH_SAFETY_MM = 2.0    # leave at least this much wall between hole bottom and exterior
+DOWEL_DEPTH_FACTOR      = 1.0    # ideal hole depth per side = this * dowel dia (1x = standard wood-joint depth)
+DOWEL_THROUGH_SAFETY_MM = 2.0    # leave at least this much wall between hole bottom and piece exterior
 DOWEL_MIN_DEPTH_FACTOR  = 0.5    # don't bother with a dowel if each side is shorter than this * dia
+DOWEL_CROSS_SAFETY_MM   = 1.0    # extra gap between a hole's bottom and any perpendicular hole's cylinder
 DOWEL_WALL_MARGIN_MM    = 1.5    # min wall thickness between dowel and cut edge
 DOWEL_SPACING_FACTOR    = 3.0    # minimum center-to-center distance = this * dia
 MIN_DOWELS_PER_FACE     = 2      # target at least this many per shared face for alignment
@@ -484,31 +485,73 @@ def _make_cylinder_world(center_xyz: np.ndarray, axis: int,
     return cyl
 
 
-def _safe_half_depth(piece: trimesh.Trimesh, pt_world: np.ndarray,
-                     axis: int, sign: int, ideal_depth: float) -> float:
-    """Max depth the hole can penetrate into `piece` from `pt_world` along
-    sign*axis before hitting the piece's opposite exterior wall.
+def _aabbs_overlap(a: np.ndarray, b: np.ndarray, pad: float = 0.0) -> bool:
+    """True if two axis-aligned bounding boxes overlap, with `pad` mm slack
+    added to each box's extent. `a` and `b` are (2, 3) arrays as returned by
+    `Trimesh.bounds`.
+    """
+    return bool(
+        a[1, 0] + pad >= b[0, 0] - pad and b[1, 0] + pad >= a[0, 0] - pad and
+        a[1, 1] + pad >= b[0, 1] - pad and b[1, 1] + pad >= a[0, 1] - pad and
+        a[1, 2] + pad >= b[0, 2] - pad and b[1, 2] + pad >= a[0, 2] - pad
+    )
 
-    Shoots a ray from pt_world along `sign*axis`; if the ray exits the piece
-    closer than `ideal_depth + safety`, shortens the hole accordingly.
+
+def _safe_half_depth(piece: trimesh.Trimesh, pt_world: np.ndarray,
+                     axis: int, sign: int, ideal_depth: float,
+                     hole_radius: float) -> float:
+    """Max depth the hole can penetrate into `piece` from `pt_world` along
+    sign*axis without the hole (a cylinder of `hole_radius`) punching through
+    any exterior wall of `piece`.
+
+    Uses direct point-in-mesh containment testing at sampled points on the
+    cylinder surface (center + 8 perimeter) at 20 depths from 0 to
+    `ideal_depth`. We keep stepping deeper as long as ALL sample points at
+    that depth are inside the piece, and stop the moment any sample exits —
+    that's where the cylinder would break through the exterior.
+
+    This is more robust than ray casting for complex / slightly non-manifold
+    geometry, where rays can graze-miss and give false "safe" answers.
     """
     direction = np.zeros(3)
     direction[axis] = float(sign)
-    # Small step into the piece so the ray doesn't self-intersect the cut face
-    origin = pt_world + direction * 0.3
+    other = [a for a in range(3) if a != axis]
+
+    n_perim = 8
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_perim, endpoint=False)
+    perim_offsets = np.zeros((n_perim, 3))
+    perim_offsets[:, other[0]] = hole_radius * np.cos(thetas)
+    perim_offsets[:, other[1]] = hole_radius * np.sin(thetas)
+
+    # 20 depth samples from 0.5 mm (so we skip numerical fuzz right at the
+    # cut plane) to ideal_depth
+    depths = np.linspace(0.5, ideal_depth, 20)
+    n_points_per_depth = 1 + n_perim  # center + perimeter
+
+    all_points = np.empty((len(depths) * n_points_per_depth, 3), dtype=np.float64)
+    for di, d in enumerate(depths):
+        base_offset = direction * d
+        row = di * n_points_per_depth
+        all_points[row] = pt_world + base_offset           # center point
+        for pi, off in enumerate(perim_offsets):
+            all_points[row + 1 + pi] = pt_world + off + base_offset
+
     try:
-        locations = piece.ray.intersects_location(
-            ray_origins=np.array([origin]),
-            ray_directions=np.array([direction]),
-        )[0]
+        inside = piece.contains(all_points)
     except Exception:
-        return ideal_depth
-    if len(locations) == 0:
-        # Ray didn't find an exit wall — treat as safe
-        return ideal_depth
-    dists = np.linalg.norm(locations - origin, axis=1)
-    wall_distance = float(np.min(dists))
-    return min(ideal_depth, max(0.0, wall_distance - DOWEL_THROUGH_SAFETY_MM))
+        return 0.0
+
+    inside_by_depth = inside.reshape(len(depths), n_points_per_depth)
+    all_inside = inside_by_depth.all(axis=1)
+
+    if not all_inside[0]:
+        return 0.0
+
+    # Last depth where every sample is still inside the piece
+    first_outside = int(np.argmax(~all_inside)) if (~all_inside).any() else len(depths)
+    last_safe_idx = first_outside - 1
+    max_safe = float(depths[last_safe_idx])
+    return max(0.0, max_safe - DOWEL_THROUGH_SAFETY_MM)
 
 
 # ---------- wall-marking labels ----------
@@ -700,6 +743,13 @@ def drill_dowel_holes(
       {axis, plane_coord, cells, size_label, diam_mm, count, area_mm2, mark}
     """
     per_piece: dict[tuple[int, int, int], list[trimesh.Trimesh]] = defaultdict(list)
+    # Cache axis-aligned bounds of every cylinder we accept onto a piece, so
+    # subsequent dowels on the same piece can be checked for collision. Two
+    # perpendicular cylinders that overlap inside one piece create a connected
+    # void with two openings — topologically a through-hole — even though
+    # neither cylinder alone breaks through the exterior.
+    per_piece_aabbs: dict[tuple[int, int, int], list[np.ndarray]] = defaultdict(list)
+    n_skipped_collisions = 0
     face_records: list[dict] = []
 
     # Assign labels in a deterministic axis-major order
@@ -743,8 +793,10 @@ def drill_dowel_holes(
                         min_depth = diam * DOWEL_MIN_DEPTH_FACTOR
                         for (u, v) in pts_2d:
                             pt_world = (T @ np.array([u, v, 0.0, 1.0]))[:3]
-                            depth_lo = _safe_half_depth(pieces[key_lo], pt_world, axis, -1, ideal_depth)
-                            depth_hi = _safe_half_depth(pieces[key_hi], pt_world, axis, +1, ideal_depth)
+                            depth_lo = _safe_half_depth(pieces[key_lo], pt_world, axis, -1,
+                                                        ideal_depth, hole_r)
+                            depth_hi = _safe_half_depth(pieces[key_hi], pt_world, axis, +1,
+                                                        ideal_depth, hole_r)
                             safe_depth = min(depth_lo, depth_hi)
                             if safe_depth < min_depth:
                                 # Hole would be too shallow to add meaningful
@@ -752,8 +804,30 @@ def drill_dowel_holes(
                                 continue
                             cyl_len = safe_depth * 2.0
                             cyl = _make_cylinder_world(pt_world, axis, hole_r, cyl_len)
+                            cyl_aabb = cyl.bounds.copy()
+
+                            pad = DOWEL_CROSS_SAFETY_MM
+                            collides = False
+                            for existing in per_piece_aabbs[key_lo]:
+                                if _aabbs_overlap(cyl_aabb, existing, pad):
+                                    collides = True
+                                    break
+                            if not collides:
+                                for existing in per_piece_aabbs[key_hi]:
+                                    if _aabbs_overlap(cyl_aabb, existing, pad):
+                                        collides = True
+                                        break
+                            if collides:
+                                # Skipping this dowel keeps the piece's topology
+                                # simple. The face still has its other dowels for
+                                # alignment (we required >= 2 per face up front).
+                                n_skipped_collisions += 1
+                                continue
+
                             per_piece[key_lo].append(cyl)
                             per_piece[key_hi].append(cyl)
+                            per_piece_aabbs[key_lo].append(cyl_aabb)
+                            per_piece_aabbs[key_hi].append(cyl_aabb)
                             dowel_lengths_this_face.append(cyl_len)
 
                     # Text engraving (subtracted on both sides so both pieces get
@@ -788,6 +862,9 @@ def drill_dowel_holes(
     n_marks = sum(1 for r in face_records if r["mark"] != "-")
     print(f"  {n_drilled} shared face(s) drilled, {n_total} dowel hole(s) total"
           + (f"  ({n_empty} face(s) too small for any dowel)" if n_empty else ""))
+    if n_skipped_collisions:
+        print(f"  skipped {n_skipped_collisions} dowel(s) that would overlap "
+              "perpendicular holes on the same piece (would create through-tunnels)")
     if add_markings:
         print(f"  engraved {n_marks}/{len(face_records)} face labels")
 
